@@ -388,6 +388,13 @@ SSL *SSL_new(SSL_CTX *ctx)
 	CRYPTO_new_ex_data(CRYPTO_EX_INDEX_SSL, s, &s->ex_data);
 
 #ifndef OPENSSL_NO_PSK
+	s->psk_identity_hint = NULL;
+	if (ctx->psk_identity_hint)
+		{
+		s->psk_identity_hint = BUF_strdup(ctx->psk_identity_hint);
+		if (s->psk_identity_hint == NULL)
+			goto err;
+		}
 	s->psk_client_callback=ctx->psk_client_callback;
 	s->psk_server_callback=ctx->psk_server_callback;
 #endif
@@ -594,6 +601,11 @@ void SSL_free(SSL *s)
 		EVP_PKEY_free(s->tlsext_channel_id_private);
 	if (s->alpn_client_proto_list)
 		OPENSSL_free(s->alpn_client_proto_list);
+#endif
+
+#ifndef OPENSSL_NO_PSK
+	if (s->psk_identity_hint)
+		OPENSSL_free(s->psk_identity_hint);
 #endif
 
 	if (s->client_CA != NULL)
@@ -1391,6 +1403,10 @@ char *SSL_get_shared_ciphers(const SSL *s,char *buf,int len)
 
 	p=buf;
 	sk=s->session->ciphers;
+
+	if (sk_SSL_CIPHER_num(sk) == 0)
+		return NULL;
+
 	for (i=0; i<sk_SSL_CIPHER_num(sk); i++)
 		{
 		int n;
@@ -1425,6 +1441,8 @@ int ssl_cipher_list_to_bytes(SSL *s,STACK_OF(SSL_CIPHER) *sk,unsigned char *p,
 
 	if (sk == NULL) return(0);
 	q=p;
+	if (put_cb == NULL)
+		put_cb = s->method->put_cipher_by_char;
 
 	for (i=0; i<sk_SSL_CIPHER_num(sk); i++)
 		{
@@ -1440,29 +1458,40 @@ int ssl_cipher_list_to_bytes(SSL *s,STACK_OF(SSL_CIPHER) *sk,unsigned char *p,
 #endif /* OPENSSL_NO_KRB5 */
 #ifndef OPENSSL_NO_PSK
 		/* with PSK there must be client callback set */
-		if (((c->algorithm_mkey & SSL_kPSK) || (c->algorithm_auth & SSL_aPSK)) &&
+		if ((c->algorithm_auth & SSL_aPSK) &&
 		    s->psk_client_callback == NULL)
 			continue;
 #endif /* OPENSSL_NO_PSK */
-		j = put_cb ? put_cb(c,p) : ssl_put_cipher_by_char(s,c,p);
+		j = put_cb(c,p);
 		p+=j;
 		}
-	/* If p == q, no ciphers and caller indicates an error. Otherwise
-	 * add SCSV if not renegotiating.
-	 */
-	if (p != q && !s->renegotiate)
+	/* If p == q, no ciphers; caller indicates an error.
+	 * Otherwise, add applicable SCSVs. */
+	if (p != q)
 		{
-		static SSL_CIPHER scsv =
+		if (!s->renegotiate)
 			{
-			0, NULL, SSL3_CK_SCSV, 0, 0, 0, 0, 0, 0, 0, 0, 0
-			};
-		j = put_cb ? put_cb(&scsv,p) : ssl_put_cipher_by_char(s,&scsv,p);
-		p+=j;
+			static SSL_CIPHER scsv =
+				{
+				0, NULL, SSL3_CK_SCSV, 0, 0, 0, 0, 0, 0, 0, 0, 0
+				};
+			j = put_cb(&scsv,p);
+			p+=j;
 #ifdef OPENSSL_RI_DEBUG
-		fprintf(stderr, "SCSV sent by client\n");
+			fprintf(stderr, "TLS_EMPTY_RENEGOTIATION_INFO_SCSV sent by client\n");
 #endif
-		}
+			}
 
+		if (s->mode & SSL_MODE_SEND_FALLBACK_SCSV)
+			{
+			static SSL_CIPHER scsv =
+				{
+				0, NULL, SSL3_CK_FALLBACK_SCSV, 0, 0, 0, 0, 0, 0, 0, 0, 0
+				};
+			j = put_cb(&scsv,p);
+			p+=j;
+			}
+ 		}
 	return(p-q);
 	}
 
@@ -1472,11 +1501,12 @@ STACK_OF(SSL_CIPHER) *ssl_bytes_to_cipher_list(SSL *s,unsigned char *p,int num,
 	const SSL_CIPHER *c;
 	STACK_OF(SSL_CIPHER) *sk;
 	int i,n;
+
 	if (s->s3)
 		s->s3->send_connection_binding = 0;
 
 	n=ssl_put_cipher_by_char(s,NULL,NULL);
-	if ((num%n) != 0)
+	if (n == 0 || (num%n) != 0)
 		{
 		SSLerr(SSL_F_SSL_BYTES_TO_CIPHER_LIST,SSL_R_ERROR_IN_RECEIVED_CIPHER_LIST);
 		return(NULL);
@@ -1491,7 +1521,7 @@ STACK_OF(SSL_CIPHER) *ssl_bytes_to_cipher_list(SSL *s,unsigned char *p,int num,
 
 	for (i=0; i<num; i+=n)
 		{
-		/* Check for SCSV */
+		/* Check for TLS_EMPTY_RENEGOTIATION_INFO_SCSV */
 		if (s->s3 && (n != 3 || !p[0]) &&
 			(p[n-2] == ((SSL3_CK_SCSV >> 8) & 0xff)) &&
 			(p[n-1] == (SSL3_CK_SCSV & 0xff)))
@@ -1508,6 +1538,22 @@ STACK_OF(SSL_CIPHER) *ssl_bytes_to_cipher_list(SSL *s,unsigned char *p,int num,
 #ifdef OPENSSL_RI_DEBUG
 			fprintf(stderr, "SCSV received by server\n");
 #endif
+			continue;
+			}
+
+		/* Check for TLS_FALLBACK_SCSV */
+		if (s->s3 && (n != 3 || !p[0]) &&
+			(p[n-2] == ((SSL3_CK_FALLBACK_SCSV >> 8) & 0xff)) &&
+			(p[n-1] == (SSL3_CK_FALLBACK_SCSV & 0xff)))
+			{
+			/* The SCSV indicates that the client previously tried a higher version.
+			 * Fail if the current version is an unexpected downgrade. */
+			if (!SSL_ctrl(s, SSL_CTRL_CHECK_PROTO_VERSION, 0, NULL))
+				{
+				SSLerr(SSL_F_SSL_BYTES_TO_CIPHER_LIST,SSL_R_INAPPROPRIATE_FALLBACK);
+				ssl3_send_alert(s,SSL3_AL_FATAL,SSL_AD_INAPPROPRIATE_FALLBACK);
+				goto err;
+				}
 			continue;
 			}
 
@@ -1911,7 +1957,9 @@ SSL_CTX *SSL_CTX_new(const SSL_METHOD *meth)
 	CRYPTO_new_ex_data(CRYPTO_EX_INDEX_SSL_CTX, ret, &ret->ex_data);
 
 	ret->extra_certs=NULL;
-	ret->comp_methods=SSL_COMP_get_compression_methods();
+	/* No compression for DTLS */
+	if (meth->version != DTLS1_VERSION)
+		ret->comp_methods=SSL_COMP_get_compression_methods();
 
 	ret->max_send_fragment = SSL3_RT_MAX_PLAIN_LENGTH;
 
@@ -2657,6 +2705,10 @@ int SSL_get_error(const SSL *s,int i)
 		{
 		return(SSL_ERROR_WANT_X509_LOOKUP);
 		}
+	if ((i < 0) && SSL_want_channel_id_lookup(s))
+		{
+		return(SSL_ERROR_WANT_CHANNEL_ID_LOOKUP);
+		}
 
 	if (i == 0)
 		{
@@ -2945,9 +2997,7 @@ void ssl_clear_cipher_ctx(SSL *s)
 /* Fix this function so that it takes an optional type parameter */
 X509 *SSL_get_certificate(const SSL *s)
 	{
-	if (s->server)
-		return(ssl_get_server_send_cert(s));
-	else if (s->cert != NULL)
+	if (s->cert != NULL)
 		return(s->cert->key->x509);
 	else
 		return(NULL);
@@ -3303,32 +3353,54 @@ int SSL_use_psk_identity_hint(SSL *s, const char *identity_hint)
 	if (s == NULL)
 		return 0;
 
-	if (s->session == NULL)
-		return 1; /* session not created yet, ignored */
-
 	if (identity_hint != NULL && strlen(identity_hint) > PSK_MAX_IDENTITY_LEN)
 		{
 		SSLerr(SSL_F_SSL_USE_PSK_IDENTITY_HINT, SSL_R_DATA_LENGTH_TOO_LONG);
 		return 0;
 		}
-	if (s->session->psk_identity_hint != NULL)
+
+	/* Clear hint in SSL and associated SSL_SESSION (if any). */
+	if (s->psk_identity_hint != NULL)
+		{
+		OPENSSL_free(s->psk_identity_hint);
+		s->psk_identity_hint = NULL;
+		}
+	if (s->session != NULL && s->session->psk_identity_hint != NULL)
+		{
 		OPENSSL_free(s->session->psk_identity_hint);
+		s->session->psk_identity_hint = NULL;
+		}
+
 	if (identity_hint != NULL)
 		{
-		s->session->psk_identity_hint = BUF_strdup(identity_hint);
-		if (s->session->psk_identity_hint == NULL)
-			return 0;
+		/* The hint is stored in SSL and SSL_SESSION with the one in
+		 * SSL_SESSION taking precedence. Thus, if SSL_SESSION is avaiable,
+		 * we store the hint there, otherwise we store it in SSL. */
+		if (s->session != NULL)
+			{
+			s->session->psk_identity_hint = BUF_strdup(identity_hint);
+			if (s->session->psk_identity_hint == NULL)
+				return 0;
+			}
+		else
+			{
+			s->psk_identity_hint = BUF_strdup(identity_hint);
+			if (s->psk_identity_hint == NULL)
+				return 0;
+			}
 		}
-	else
-		s->session->psk_identity_hint = NULL;
 	return 1;
 	}
 
 const char *SSL_get_psk_identity_hint(const SSL *s)
 	{
-	if (s == NULL || s->session == NULL)
+	if (s == NULL)
 		return NULL;
-	return(s->session->psk_identity_hint);
+	/* The hint is stored in SSL and SSL_SESSION with the one in SSL_SESSION
+	 * taking precedence. */
+	if (s->session != NULL)
+		return(s->session->psk_identity_hint);
+	return(s->psk_identity_hint);
 	}
 
 const char *SSL_get_psk_identity(const SSL *s)
@@ -3385,10 +3457,39 @@ int SSL_cutthrough_complete(const SSL *s)
 		s->version >= SSL3_VERSION &&
 		s->s3->in_read_app_data == 0 &&   /* cutthrough only applies to write() */
 		(SSL_get_mode((SSL*)s) & SSL_MODE_HANDSHAKE_CUTTHROUGH) &&  /* cutthrough enabled */
-		SSL_get_cipher_bits(s, NULL) >= 128 &&                      /* strong cipher choosen */
+		ssl3_can_cutthrough(s) &&                                   /* cutthrough allowed */
 		s->s3->previous_server_finished_len == 0 &&                 /* not a renegotiation handshake */
 		(s->state == SSL3_ST_CR_SESSION_TICKET_A ||                 /* ready to write app-data*/
 			s->state == SSL3_ST_CR_FINISHED_A));
+	}
+
+int ssl3_can_cutthrough(const SSL *s)
+	{
+	const SSL_CIPHER *c;
+
+	/* require a strong enough cipher */
+	if (SSL_get_cipher_bits(s, NULL) < 128)
+		return 0;
+
+	/* require ALPN or NPN extension */
+	if (!s->s3->alpn_selected
+#ifndef OPENSSL_NO_NEXTPROTONEG
+		&& !s->s3->next_proto_neg_seen
+#endif
+	)
+		{
+		return 0;
+		}
+
+	/* require a forward-secret cipher */
+	c = SSL_get_current_cipher(s);
+	if (!c || (c->algorithm_mkey != SSL_kEDH &&
+			c->algorithm_mkey != SSL_kEECDH))
+		{
+		return 0;
+		}
+
+	return 1;
 	}
 
 /* Allocates new EVP_MD_CTX and sets pointer to it into given pointer

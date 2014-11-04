@@ -335,6 +335,7 @@ static void sc_usage(void)
 	BIO_printf(bio_err," -tls1_1       - just use TLSv1.1\n");
 	BIO_printf(bio_err," -tls1         - just use TLSv1\n");
 	BIO_printf(bio_err," -dtls1        - just use DTLSv1\n");    
+	BIO_printf(bio_err," -fallback_scsv - send TLS_FALLBACK_SCSV\n");
 	BIO_printf(bio_err," -mtu          - set the link layer MTU\n");
 	BIO_printf(bio_err," -no_tls1_2/-no_tls1_1/-no_tls1/-no_ssl3/-no_ssl2 - turn off that protocol\n");
 	BIO_printf(bio_err," -bugs         - Switch on all SSL implementation bug workarounds\n");
@@ -363,6 +364,7 @@ static void sc_usage(void)
 # endif
 #endif
 	BIO_printf(bio_err," -cutthrough       - enable 1-RTT full-handshake for strong ciphers\n");
+	BIO_printf(bio_err," -no_record_splitting  - disable 1/n-1 record splitting in CBC mode\n");
 	BIO_printf(bio_err," -legacy_renegotiation - enable use of legacy renegotiation (dangerous)\n");
 #ifndef OPENSSL_NO_SRTP
 	BIO_printf(bio_err," -use_srtp profiles - Offer SRTP key management with a colon-separated profile list\n");
@@ -579,7 +581,7 @@ int MAIN(int argc, char **argv)
 	EVP_PKEY *key = NULL;
 	char *CApath=NULL,*CAfile=NULL,*cipher=NULL;
 	int reconnect=0,badop=0,verify=SSL_VERIFY_NONE,bugs=0;
-	int cutthrough=0;
+	int cutthrough=0, no_record_splitting=0;
 	int crlf=0;
 	int write_tty,read_tty,write_ssl,read_ssl,tty_on,ssl_pending;
 	SSL_CTX *ctx=NULL;
@@ -594,6 +596,7 @@ int MAIN(int argc, char **argv)
 	char *inrand=NULL;
 	int mbuf_len=0;
 	struct timeval timeout, *timeoutp;
+	int ssl_mode;
 #ifndef OPENSSL_NO_ENGINE
 	char *engine_id=NULL;
 	char *ssl_client_engine_id=NULL;
@@ -619,6 +622,7 @@ int MAIN(int argc, char **argv)
 	char *sess_out = NULL;
 	struct sockaddr peer;
 	int peerlen = sizeof(peer);
+	int fallback_scsv = 0;
 	int enable_timeouts = 0 ;
 	long socket_mtu = 0;
 #ifndef OPENSSL_NO_JPAKE
@@ -825,6 +829,10 @@ int MAIN(int argc, char **argv)
 			meth=DTLSv1_client_method();
 			socket_type=SOCK_DGRAM;
 			}
+		else if (strcmp(*argv,"-fallback_scsv") == 0)
+			{
+			fallback_scsv = 1;
+			}
 		else if (strcmp(*argv,"-timeout") == 0)
 			enable_timeouts=1;
 		else if (strcmp(*argv,"-mtu") == 0)
@@ -894,6 +902,8 @@ int MAIN(int argc, char **argv)
 #endif
 		else if (strcmp(*argv,"-cutthrough") == 0)
 			cutthrough=1;
+		else if (strcmp(*argv,"-no_record_splitting") == 0)
+			no_record_splitting=1;
 		else if (strcmp(*argv,"-serverpref") == 0)
 			off|=SSL_OP_CIPHER_SERVER_PREFERENCE;
 		else if (strcmp(*argv,"-legacy_renegotiation") == 0)
@@ -1183,14 +1193,16 @@ bad:
 		}
 #endif
 
-	/* Enable handshake cutthrough for client connections using
-	 * strong ciphers. */
+	ssl_mode = SSL_CTX_get_mode(ctx);
+	if (!no_record_splitting)
+		ssl_mode |= SSL_MODE_CBC_RECORD_SPLITTING;
 	if (cutthrough)
 		{
-		int ssl_mode = SSL_CTX_get_mode(ctx);
+		/* Enable handshake cutthrough for client connections using
+		 * strong ciphers. */
 		ssl_mode |= SSL_MODE_HANDSHAKE_CUTTHROUGH;
-		SSL_CTX_set_mode(ctx, ssl_mode);
 		}
+	SSL_CTX_set_mode(ctx, ssl_mode);
 
 	if (state) SSL_CTX_set_info_callback(ctx,apps_ssl_info_callback);
 	if (cipher != NULL)
@@ -1267,6 +1279,10 @@ bad:
 		SSL_set_session(con, sess);
 		SSL_SESSION_free(sess);
 		}
+
+	if (fallback_scsv)
+		SSL_set_mode(con, SSL_MODE_SEND_FALLBACK_SCSV);
+
 #ifndef OPENSSL_NO_TLSEXT
 	if (servername != NULL)
 		{

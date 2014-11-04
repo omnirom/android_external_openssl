@@ -428,27 +428,26 @@ int ssl3_setup_key_block(SSL *s)
 
 	ret = ssl3_generate_key_block(s,p,num);
 
-	if (!(s->options & SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS))
+	/* enable vulnerability countermeasure for CBC ciphers with
+	 * known-IV problem (http://www.openssl.org/~bodo/tls-cbc.txt) */
+	if ((s->mode & SSL_MODE_CBC_RECORD_SPLITTING) != 0)
 		{
-		/* enable vulnerability countermeasure for CBC ciphers with
-		 * known-IV problem (http://www.openssl.org/~bodo/tls-cbc.txt)
-		 */
-		s->s3->need_empty_fragments = 1;
+		s->s3->need_record_splitting = 1;
 
 		if (s->session->cipher != NULL)
 			{
 			if (s->session->cipher->algorithm_enc == SSL_eNULL)
-				s->s3->need_empty_fragments = 0;
-			
+				s->s3->need_record_splitting = 0;
+
 #ifndef OPENSSL_NO_RC4
 			if (s->session->cipher->algorithm_enc == SSL_RC4)
-				s->s3->need_empty_fragments = 0;
+				s->s3->need_record_splitting = 0;
 #endif
 			}
 		}
 
 	return ret;
-		
+
 err:
 	SSLerr(SSL_F_SSL3_SETUP_KEY_BLOCK,ERR_R_MALLOC_FAILURE);
 	return(0);
@@ -729,7 +728,7 @@ int n_ssl3_mac(SSL *ssl, unsigned char *md, int send)
 		}
 
 	t=EVP_MD_CTX_size(hash);
-	if (t < 0)
+	if (t < 0 || t > 20)
 		return -1;
 	md_size=t;
 	npad=(48/md_size)*md_size;
@@ -892,7 +891,7 @@ int ssl3_alert_code(int code)
 	case SSL_AD_BAD_CERTIFICATE_STATUS_RESPONSE: return(SSL3_AD_HANDSHAKE_FAILURE);
 	case SSL_AD_BAD_CERTIFICATE_HASH_VALUE: return(SSL3_AD_HANDSHAKE_FAILURE);
 	case SSL_AD_UNKNOWN_PSK_IDENTITY:return(TLS1_AD_UNKNOWN_PSK_IDENTITY);
+	case SSL_AD_INAPPROPRIATE_FALLBACK:return(TLS1_AD_INAPPROPRIATE_FALLBACK);
 	default:			return(-1);
 		}
 	}
-

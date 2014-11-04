@@ -1683,7 +1683,7 @@ OPENSSL_GLOBAL SSL_CIPHER ssl3_ciphers[]={
 	SSL_3DES,
 	SSL_SHA1,
 	SSL_TLSV1,
-	SSL_NOT_EXP|SSL_HIGH,
+	SSL_NOT_EXP|SSL_HIGH|SSL_FIPS,
 	SSL_HANDSHAKE_MAC_DEFAULT|TLS1_PRF,
 	168,
 	168,
@@ -1699,7 +1699,7 @@ OPENSSL_GLOBAL SSL_CIPHER ssl3_ciphers[]={
 	SSL_AES128,
 	SSL_SHA1,
 	SSL_TLSV1,
-	SSL_NOT_EXP|SSL_HIGH,
+	SSL_NOT_EXP|SSL_HIGH|SSL_FIPS,
 	SSL_HANDSHAKE_MAC_DEFAULT|TLS1_PRF,
 	128,
 	128,
@@ -1715,7 +1715,7 @@ OPENSSL_GLOBAL SSL_CIPHER ssl3_ciphers[]={
 	SSL_AES256,
 	SSL_SHA1,
 	SSL_TLSV1,
-	SSL_NOT_EXP|SSL_HIGH,
+	SSL_NOT_EXP|SSL_HIGH|SSL_FIPS,
 	SSL_HANDSHAKE_MAC_DEFAULT|TLS1_PRF,
 	256,
 	256,
@@ -2826,6 +2826,41 @@ OPENSSL_GLOBAL SSL_CIPHER ssl3_ciphers[]={
 	256,
 	},
 
+#ifndef OPENSSL_NO_PSK
+    /* ECDH PSK ciphersuites from RFC 5489 */
+	/* Cipher C035 */
+	{
+	1,
+	TLS1_TXT_ECDHE_PSK_WITH_AES_128_CBC_SHA,
+	TLS1_CK_ECDHE_PSK_WITH_AES_128_CBC_SHA,
+	SSL_kEECDH,
+	SSL_aPSK,
+	SSL_AES128,
+	SSL_SHA1,
+	SSL_TLSV1,
+	SSL_NOT_EXP|SSL_HIGH|SSL_FIPS,
+	SSL_HANDSHAKE_MAC_DEFAULT|TLS1_PRF,
+	128,
+	128,
+	},
+
+	/* Cipher C036 */
+	{
+	1,
+	TLS1_TXT_ECDHE_PSK_WITH_AES_256_CBC_SHA,
+	TLS1_CK_ECDHE_PSK_WITH_AES_256_CBC_SHA,
+	SSL_kEECDH,
+	SSL_aPSK,
+	SSL_AES256,
+	SSL_SHA1,
+	SSL_TLSV1,
+	SSL_NOT_EXP|SSL_HIGH|SSL_FIPS,
+	SSL_HANDSHAKE_MAC_DEFAULT|TLS1_PRF,
+	256,
+	256,
+	},
+#endif /* OPENSSL_NO_PSK */
+
 #endif /* OPENSSL_NO_ECDH */
 
 
@@ -3047,6 +3082,11 @@ void ssl3_clear(SSL *s)
 		s->s3->tmp.ecdh = NULL;
 		}
 #endif
+#ifndef OPENSSL_NO_TLSEXT
+#ifndef OPENSSL_NO_EC
+	s->s3->is_probably_safari = 0;
+#endif /* !OPENSSL_NO_EC */
+#endif /* !OPENSSL_NO_TLSEXT */
 
 	rp = s->s3->rbuf.buf;
 	wp = s->s3->wbuf.buf;
@@ -3371,8 +3411,6 @@ long ssl3_ctrl(SSL *s, int cmd, long larg, void *parg)
 		break;
 #endif
 	case SSL_CTRL_CHANNEL_ID:
-		if (!s->server)
-			break;
 		s->tlsext_channel_id_enabled = 1;
 		ret = 1;
 		break;
@@ -3388,7 +3426,7 @@ long ssl3_ctrl(SSL *s, int cmd, long larg, void *parg)
 			}
 		if (s->tlsext_channel_id_private)
 			EVP_PKEY_free(s->tlsext_channel_id_private);
-		s->tlsext_channel_id_private = (EVP_PKEY*) parg;
+		s->tlsext_channel_id_private = EVP_PKEY_dup((EVP_PKEY*) parg);
 		ret = 1;
 		break;
 
@@ -3401,6 +3439,33 @@ long ssl3_ctrl(SSL *s, int cmd, long larg, void *parg)
 		return 64;
 
 #endif /* !OPENSSL_NO_TLSEXT */
+
+	case SSL_CTRL_CHECK_PROTO_VERSION:
+		/* For library-internal use; checks that the current protocol
+		 * is the highest enabled version (according to s->ctx->method,
+		 * as version negotiation may have changed s->method). */
+		if (s->version == s->ctx->method->version)
+			return 1;
+		/* Apparently we're using a version-flexible SSL_METHOD
+		 * (not at its highest protocol version). */
+		if (s->ctx->method->version == SSLv23_method()->version)
+			{
+#if TLS_MAX_VERSION != TLS1_2_VERSION
+#  error Code needs update for SSLv23_method() support beyond TLS1_2_VERSION.
+#endif
+			if (!(s->options & SSL_OP_NO_TLSv1_2))
+				return s->version == TLS1_2_VERSION;
+			if (!(s->options & SSL_OP_NO_TLSv1_1))
+				return s->version == TLS1_1_VERSION;
+			if (!(s->options & SSL_OP_NO_TLSv1))
+				return s->version == TLS1_VERSION;
+			if (!(s->options & SSL_OP_NO_SSLv3))
+				return s->version == SSL3_VERSION;
+			if (!(s->options & SSL_OP_NO_SSLv2))
+				return s->version == SSL2_VERSION;
+			}
+		return 0; /* Unexpected state; fail closed. */
+
 	default:
 		break;
 		}
@@ -3703,7 +3768,7 @@ long ssl3_ctx_ctrl(SSL_CTX *ctx, int cmd, long larg, void *parg)
 			}
 		if (ctx->tlsext_channel_id_private)
 			EVP_PKEY_free(ctx->tlsext_channel_id_private);
-		ctx->tlsext_channel_id_private = (EVP_PKEY*) parg;
+		ctx->tlsext_channel_id_private = EVP_PKEY_dup((EVP_PKEY*) parg);
 		break;
 
 	default:
@@ -3778,6 +3843,7 @@ long ssl3_ctx_callback_ctrl(SSL_CTX *ctx, int cmd, void (*fp)(void))
 		break;
 #endif
 #endif
+
 	default:
 		return(0);
 		}
@@ -3906,7 +3972,7 @@ SSL_CIPHER *ssl3_choose_cipher(SSL *s, STACK_OF(SSL_CIPHER) *clnt,
 #endif /* OPENSSL_NO_KRB5 */
 #ifndef OPENSSL_NO_PSK
 		/* with PSK there must be server callback set */
-		if ((alg_k & SSL_kPSK) && s->psk_server_callback == NULL)
+		if ((alg_a & SSL_aPSK) && s->psk_server_callback == NULL)
 			continue;
 #endif /* OPENSSL_NO_PSK */
 
@@ -4085,6 +4151,13 @@ SSL_CIPHER *ssl3_choose_cipher(SSL *s, STACK_OF(SSL_CIPHER) *clnt,
 		ii=sk_SSL_CIPHER_find(allow,c);
 		if (ii >= 0)
 			{
+#if !defined(OPENSSL_NO_EC) && !defined(OPENSSL_NO_TLSEXT)
+			if ((alg_k & SSL_kEECDH) && (alg_a & SSL_aECDSA) && s->s3->is_probably_safari)
+				{
+				if (!ret) ret=sk_SSL_CIPHER_value(allow,ii);
+				continue;
+				}
+#endif
 			ret=sk_SSL_CIPHER_value(allow,ii);
 			break;
 			}
@@ -4356,9 +4429,8 @@ need to go to SSL_ST_ACCEPT.
 long ssl_get_algorithm2(SSL *s)
 	{
 	long alg2 = s->s3->tmp.new_cipher->algorithm2;
-	if (TLS1_get_version(s) >= TLS1_2_VERSION &&
+	if (s->method->version == TLS1_2_VERSION &&
 	    alg2 == (SSL_HANDSHAKE_MAC_DEFAULT|TLS1_PRF))
 		return SSL_HANDSHAKE_MAC_SHA256 | TLS1_PRF_SHA256;
 	return alg2;
 	}
-		

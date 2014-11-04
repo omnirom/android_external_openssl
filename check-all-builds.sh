@@ -139,7 +139,11 @@ case $HOST_OS in
 esac
 
 # The list of supported Android target architectures.
-ANDROID_ARCHS="arm x86 mips"
+
+# NOTE: x86_64 is not ready yet, while the toolchain is in
+# prebuilts/ it doesn't have a sysroot which means it requires
+# a platform build to get Bionic and stuff.
+ANDROID_ARCHS="arm arm64 x86 x86_64 mips"
 
 BUILD_TYPES=
 for ARCH in $ANDROID_ARCHS; do
@@ -147,9 +151,8 @@ for ARCH in $ANDROID_ARCHS; do
 done
 ANDROID_BUILD_TYPES=$BUILD_TYPES
 
-# NOTE: The $HOST_OS-x86_64 is currently broken because the single
-#       <openssl/opensslconf.h> header is tailored for 32-bits.
 HOST_BUILD_TYPES="$HOST_OS-x86 $HOST_OS-generic32 $HOST_OS-generic64"
+HOST_BUILD_TYPES="$HOST_BUILD_TYPES $HOST_OS-x86_64"
 
 BUILD_TYPES="$ANDROID_BUILD_TYPES $HOST_BUILD_TYPES"
 
@@ -308,11 +311,17 @@ get_build_arch () {
 # Out: GNU configuration target (e.g. arm-linux-androideabi)
 get_build_arch_target () {
   case $1 in
+    arm64)
+      echo "aarch64-linux-android"
+      ;;
     arm)
       echo "arm-linux-androideabi"
       ;;
     x86)
-      echo "i686-linux-android"
+      echo "x86_64-linux-android"
+      ;;
+    x86_64)
+      echo "x86_64-linux-android"
       ;;
     mips)
       echo "mipsel-linux-android"
@@ -323,12 +332,22 @@ get_build_arch_target () {
   esac
 }
 
-GCC_VERSION=4.7
-CLANG_VERSION=3.1
+GCC_VERSION=4.8
+CLANG_VERSION=3.2
 
 get_prebuilt_gcc_dir_for_arch () {
   local arch=$1
   local target=$(get_build_arch_target $arch)
+  # Adjust $arch for x86_64 because the prebuilts are actually
+  # under prebuilts/gcc/<host>/x86/
+  case $arch in
+    x86_64)
+        arch=x86
+        ;;
+    arm64)
+        arch=aarch64
+        ;;
+  esac
   echo "$ANDROID_BUILD_TOP/prebuilts/gcc/$ANDROID_HOST_TAG/$arch/$target-$GCC_VERSION"
 }
 
@@ -384,7 +403,7 @@ get_build_compiler () {
 
   # Force -m32 flag when needed for 32-bit builds.
   case $1 in
-    *-linux-x86|*-darwin-x86|*-generic32)
+    *-x86|*-generic32)
       result="$result -m32"
       ;;
   esac
@@ -623,6 +642,6 @@ case $? in
     dump "Error, try doing the following to inspect the issues:"
     dump "   $PROGNAME --build-dir=/tmp/mybuild"
     dump "   make -C /tmp/mybuild V=1"
-    dump ""
+    dump " "
     ;;
 esac

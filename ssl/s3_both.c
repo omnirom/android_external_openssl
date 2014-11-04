@@ -161,6 +161,8 @@ int ssl3_send_finished(SSL *s, int a, int b, const char *sender, int slen)
 
 		i=s->method->ssl3_enc->final_finish_mac(s,
 			sender,slen,s->s3->tmp.finish_md);
+		if (i == 0)
+			return 0;
 		s->s3->tmp.finish_md_len = i;
 		memcpy(p, s->s3->tmp.finish_md, i);
 		p+=i;
@@ -208,7 +210,11 @@ static void ssl3_take_mac(SSL *s)
 	{
 	const char *sender;
 	int slen;
-
+	/* If no new cipher setup return immediately: other functions will
+	 * set the appropriate error.
+	 */
+	if (s->s3->tmp.new_cipher == NULL)
+		return;
 	if (s->state & SSL_ST_CONNECT)
 		{
 		sender=s->method->ssl3_enc->server_finished_label;
@@ -555,7 +561,7 @@ long ssl3_get_message(SSL *s, int st1, int stn, int mt, long max, int *ok)
 #endif
 
 	/* Feed this message into MAC computation. */
-	if (*(unsigned char*)s->init_buf->data != SSL3_MT_ENCRYPTED_EXTENSIONS)
+	if (*((unsigned char*) s->init_buf->data) != SSL3_MT_ENCRYPTED_EXTENSIONS)
 		ssl3_finish_mac(s, (unsigned char *)s->init_buf->data, s->init_num + 4);
 	if (s->msg_callback)
 		s->msg_callback(0, s->version, SSL3_RT_HANDSHAKE, s->init_buf->data, (size_t)s->init_num + 4, s, s->msg_callback_arg);

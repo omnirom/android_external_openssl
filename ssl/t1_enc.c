@@ -414,15 +414,20 @@ int tls1_change_cipher_state(SSL *s, int which)
 			s->mac_flags |= SSL_MAC_FLAG_WRITE_MAC_STREAM;
 			else
 			s->mac_flags &= ~SSL_MAC_FLAG_WRITE_MAC_STREAM;
-		if (s->enc_write_ctx != NULL)
+		if (s->enc_write_ctx != NULL && !SSL_IS_DTLS(s))
 			reuse_dd = 1;
-		else if ((s->enc_write_ctx=OPENSSL_malloc(sizeof(EVP_CIPHER_CTX))) == NULL)
+		else if ((s->enc_write_ctx=EVP_CIPHER_CTX_new()) == NULL)
 			goto err;
-		else
-			/* make sure it's intialized in case we exit later with an error */
-			EVP_CIPHER_CTX_init(s->enc_write_ctx);
 		dd= s->enc_write_ctx;
-		mac_ctx = ssl_replace_hash(&s->write_hash,NULL);
+		if (SSL_IS_DTLS(s))
+			{
+			mac_ctx = EVP_MD_CTX_create();
+			if (!mac_ctx)
+				goto err;
+			s->write_hash = mac_ctx;
+			}
+		else
+			mac_ctx = ssl_replace_hash(&s->write_hash,NULL);
 #ifndef OPENSSL_NO_COMP
 		if (s->compress != NULL)
 			{
@@ -637,22 +642,22 @@ printf("\nkey block\n");
 { int z; for (z=0; z<num; z++) printf("%02X%c",p1[z],((z+1)%16)?' ':'\n'); }
 #endif
 
-	if (!(s->options & SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS)
-		&& s->method->version <= TLS1_VERSION)
+	if (s->method->version <= TLS1_VERSION &&
+	    (s->mode & SSL_MODE_CBC_RECORD_SPLITTING) != 0)
 		{
 		/* enable vulnerability countermeasure for CBC ciphers with
 		 * known-IV problem (http://www.openssl.org/~bodo/tls-cbc.txt)
 		 */
-		s->s3->need_empty_fragments = 1;
+		s->s3->need_record_splitting = 1;
 
 		if (s->session->cipher != NULL)
 			{
 			if (s->session->cipher->algorithm_enc == SSL_eNULL)
-				s->s3->need_empty_fragments = 0;
+				s->s3->need_record_splitting = 0;
 			
 #ifndef OPENSSL_NO_RC4
 			if (s->session->cipher->algorithm_enc == SSL_RC4)
-				s->s3->need_empty_fragments = 0;
+				s->s3->need_record_splitting = 0;
 #endif
 			}
 		}
@@ -890,53 +895,79 @@ int tls1_cert_verify_mac(SSL *s, int md_nid, unsigned char *out)
 	return((int)ret);
 	}
 
-int tls1_final_finish_mac(SSL *s,
-	     const char *str, int slen, unsigned char *out)
+/* tls1_handshake_digest calculates the current handshake hash and writes it to
+ * |out|, which has space for |out_len| bytes. It returns the number of bytes
+ * written or -1 in the event of an error. This function works on a copy of the
+ * underlying digests so can be called multiple times and prior to the final
+ * update etc. */
+int tls1_handshake_digest(SSL *s, unsigned char *out, size_t out_len)
 	{
-	unsigned int i;
+	const EVP_MD *md;
 	EVP_MD_CTX ctx;
-	unsigned char buf[2*EVP_MAX_MD_SIZE];
-	unsigned char *q,buf2[12];
-	int idx;
+	int i, err = 0, len = 0;
 	long mask;
-	int err=0;
-	const EVP_MD *md; 
-
-	q=buf;
-
-	if (s->s3->handshake_buffer) 
-		if (!ssl3_digest_cached_records(s))
-			return 0;
 
 	EVP_MD_CTX_init(&ctx);
 
-	for (idx=0;ssl_get_handshake_digest(idx,&mask,&md);idx++)
+	for (i = 0; ssl_get_handshake_digest(i, &mask, &md); i++)
 		{
-		if (mask & ssl_get_algorithm2(s))
+		int hash_size;
+		unsigned int digest_len;
+		EVP_MD_CTX *hdgst = s->s3->handshake_dgst[i];
+
+		if ((mask & ssl_get_algorithm2(s)) == 0)
+			continue;
+
+		hash_size = EVP_MD_size(md);
+		if (!hdgst || hash_size < 0 || (size_t)hash_size > out_len)
 			{
-			int hashsize = EVP_MD_size(md);
-			if (hashsize < 0 || hashsize > (int)(sizeof buf - (size_t)(q-buf)))
-				{
-				/* internal error: 'buf' is too small for this cipersuite! */
-				err = 1;
-				}
-			else
-				{
-				EVP_MD_CTX_copy_ex(&ctx,s->s3->handshake_dgst[idx]);
-				EVP_DigestFinal_ex(&ctx,q,&i);
-				if (i != (unsigned int)hashsize) /* can't really happen */
-					err = 1;
-				q+=i;
-				}
+			err = 1;
+			break;
 			}
+
+		if (!EVP_MD_CTX_copy_ex(&ctx, hdgst) ||
+		    !EVP_DigestFinal_ex(&ctx, out, &digest_len) ||
+		    digest_len != (unsigned int)hash_size) /* internal error */
+			{
+			err = 1;
+			break;
+			}
+		out += digest_len;
+		out_len -= digest_len;
+		len += digest_len;
 		}
-		
+
+	EVP_MD_CTX_cleanup(&ctx);
+
+	if (err != 0)
+		return -1;
+	return len;
+	}
+
+int tls1_final_finish_mac(SSL *s,
+	     const char *str, int slen, unsigned char *out)
+	{
+	unsigned char buf[2*EVP_MAX_MD_SIZE];
+	unsigned char buf2[12];
+	int err=0;
+	int digests_len;
+
+	if (s->s3->handshake_buffer)
+		if (!ssl3_digest_cached_records(s))
+			return 0;
+
+	digests_len = tls1_handshake_digest(s, buf, sizeof(buf));
+	if (digests_len < 0)
+		{
+		err = 1;
+		digests_len = 0;
+		}
+
 	if (!tls1_PRF(ssl_get_algorithm2(s),
-			str,slen, buf,(int)(q-buf), NULL,0, NULL,0, NULL,0,
+			str,slen, buf, digests_len, NULL,0, NULL,0, NULL,0,
 			s->session->master_key,s->session->master_key_length,
 			out,buf2,sizeof buf2))
 		err = 1;
-	EVP_MD_CTX_cleanup(&ctx);
 
 	if (err)
 		return 0;
@@ -980,7 +1011,8 @@ int tls1_mac(SSL *ssl, unsigned char *md, int send)
 		}
 		else
 		{
-			EVP_MD_CTX_copy(&hmac,hash);
+			if (!EVP_MD_CTX_copy(&hmac,hash))
+				return -1;
 			mac_ctx = &hmac;
 		}
 
@@ -1041,14 +1073,10 @@ int tls1_mac(SSL *ssl, unsigned char *md, int send)
 	if (!stream_mac)
 		EVP_MD_CTX_cleanup(&hmac);
 #ifdef TLS_DEBUG
-printf("sec=");
-{unsigned int z; for (z=0; z<md_size; z++) printf("%02X ",mac_sec[z]); printf("\n"); }
 printf("seq=");
 {int z; for (z=0; z<8; z++) printf("%02X ",seq[z]); printf("\n"); }
-printf("buf=");
-{int z; for (z=0; z<5; z++) printf("%02X ",buf[z]); printf("\n"); }
 printf("rec=");
-{unsigned int z; for (z=0; z<rec->length; z++) printf("%02X ",buf[z]); printf("\n"); }
+{unsigned int z; for (z=0; z<rec->length; z++) printf("%02X ",rec->data[z]); printf("\n"); }
 #endif
 
 	if (ssl->version != DTLS1_VERSION && ssl->version != DTLS1_BAD_VER)
@@ -1178,7 +1206,7 @@ int tls1_export_keying_material(SSL *s, unsigned char *out, size_t olen,
 	if (memcmp(val, TLS_MD_KEY_EXPANSION_CONST,
 		 TLS_MD_KEY_EXPANSION_CONST_SIZE) == 0) goto err1;
 
-	rv = tls1_PRF(s->s3->tmp.new_cipher->algorithm2,
+	rv = tls1_PRF(ssl_get_algorithm2(s),
 		      val, vallen,
 		      NULL, 0,
 		      NULL, 0,
@@ -1238,6 +1266,7 @@ int tls1_alert_code(int code)
 	case SSL_AD_BAD_CERTIFICATE_STATUS_RESPONSE: return(TLS1_AD_BAD_CERTIFICATE_STATUS_RESPONSE);
 	case SSL_AD_BAD_CERTIFICATE_HASH_VALUE: return(TLS1_AD_BAD_CERTIFICATE_HASH_VALUE);
 	case SSL_AD_UNKNOWN_PSK_IDENTITY:return(TLS1_AD_UNKNOWN_PSK_IDENTITY);
+	case SSL_AD_INAPPROPRIATE_FALLBACK:return(TLS1_AD_INAPPROPRIATE_FALLBACK);
 #if 0 /* not appropriate for TLS, not used for DTLS */
 	case DTLS1_AD_MISSING_HANDSHAKE_MESSAGE: return 
 					  (DTLS1_AD_MISSING_HANDSHAKE_MESSAGE);
